@@ -4,7 +4,11 @@ from .media import (
     StreamInfo,
     VideoStreamInfo,
 )
+
 from .operation import OperationResult
+
+from .progress import ProgressEvent
+
 
 __all__ = [
     "AudioStreamInfo",
@@ -12,4 +16,5 @@ __all__ = [
     "StreamInfo",
     "VideoStreamInfo",
     "OperationResult",
+    "ProgressEvent",
 ]

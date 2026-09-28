@@ -1,68 +1,105 @@
-from dataclasses import dataclass
+from __future__ import annotations
 
-from ..base import Operation
-from ...utils.time import (
-    validate_range,
-    format_time,
-)
+from ffmpeg_tool.operations.base import Operation
+from ffmpeg_tool.utils.time import parse_time, validate_range
 
 
-@dataclass
 class CutAudio(Operation):
+    """
+    Coupe un fichier audio entre deux positions temporelles.
+    """
 
-    input: str
-    output_path: str
+    def __init__(
+        self,
+        input: str,
+        output_path: str,
+        start: int | float | str,
+        end: int | float | str,
+        copy: bool = False,
+        codec: str | None = None,
+    ) -> None:
 
-    start: int | float | str
-    end: int | float | str
+        super().__init__(output_path)
 
-    copy: bool = False
+        self.input = input
 
-    codec: str | None = None
+        self.start = parse_time(start)
+        self.end = parse_time(end)
 
-    @property
-    def output(self) -> str:
-        return self.output_path
-
-    def build_args(self) -> list[str]:
-
-        self.check_input(self.input)
-
-        start, end = validate_range(
+        validate_range(
             self.start,
             self.end,
         )
 
-        duration = end - start
+        self.copy = copy
+        self.codec = codec
+
+    # ==================================================================
+    # Durée de sortie
+    # ==================================================================
+
+    def get_progress_duration(
+        self,
+        runner,
+    ) -> float:
+
+        return self.end - self.start
+
+    # ==================================================================
+    # Construction FFmpeg
+    # ==================================================================
+
+    def build_args(self) -> list[str]:
+
+        duration = self.end - self.start
+
+        args: list[str] = []
+
+        # --------------------------------------------------------------
+        # Copie directe
+        # --------------------------------------------------------------
 
         if self.copy:
-            args = [
-                "-ss",
-                format_time(start),
-                "-i",
-                self.input,
-                "-t",
-                format_time(duration),
-                "-c",
-                "copy",
-            ]
+
+            args.extend(
+                [
+                    "-ss",
+                    str(self.start),
+                    "-i",
+                    self.input,
+                    "-t",
+                    str(duration),
+                    "-c",
+                    "copy",
+                ]
+            )
+
+        # --------------------------------------------------------------
+        # Réencodage
+        # --------------------------------------------------------------
 
         else:
-            args = [
-                "-i",
-                self.input,
-                "-ss",
-                format_time(start),
-                "-t",
-                format_time(duration),
-            ]
 
-            if self.codec:
-                args.extend([
-                    "-c:a",
-                    self.codec,
-                ])
+            args.extend(
+                [
+                    "-i",
+                    self.input,
+                    "-ss",
+                    str(self.start),
+                    "-t",
+                    str(duration),
+                ]
+            )
 
-        args.append(self.output_path)
+            if self.codec is not None:
+
+                args.extend(
+                    [
+                        "-c:a",
+                        self.codec,
+                    ]
+                )
+
+        args.append(self.output)
 
         return args

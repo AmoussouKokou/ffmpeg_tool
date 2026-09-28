@@ -1,56 +1,85 @@
 from __future__ import annotations
 
 import subprocess
+import threading
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Callable, Sequence
+from typing import TYPE_CHECKING
 
-from .config import FFmpegConfig
-from .exceptions import (
+from ffmpeg_tool.core.config import FFmpegConfig
+from ffmpeg_tool.core.exceptions import (
     FFmpegExecutionError,
     FFmpegNotFoundError,
 )
 
+from ffmpeg_tool.models.progress import ProgressEvent
+from ffmpeg_tool.progress.parser import FFmpegProgressParser
 
-ProgressCallback = Callable[[str], None]
+
+if TYPE_CHECKING:
+    from collections.abc import Callable
 
 
-@dataclass
+@dataclass(slots=True)
 class CommandResult:
+    """
+    Résultat de l'exécution d'une commande système.
+    """
+
     command: list[str]
+
     return_code: int
+
     stdout: str
+
     stderr: str
+
     duration: float
 
 
 class FFmpegRunner:
     """
-    Low-level wrapper around FFmpeg and FFprobe.
-
-    This class is deliberately independent from audio/video operations.
+    Exécute FFmpeg et FFprobe.
     """
 
     def __init__(
         self,
         config: FFmpegConfig | None = None,
-    ):
+    ) -> None:
+
         self.config = config or FFmpegConfig()
+
+    # ==================================================================
+    # Exécution générique
+    # ==================================================================
 
     def run(
         self,
-        command: Sequence[str],
-        *,
-        progress_callback: ProgressCallback | None = None,
-        check: bool = True,
+        command: list[str],
+        progress_callback: Callable[
+            [ProgressEvent],
+            None
+        ] | None = None,
+        progress_duration: float | None = None,
+        operation_name: str | None = None,
+        operation_id: int | None = None,
     ) -> CommandResult:
 
-        command = [str(arg) for arg in command]
+        start_time = time.monotonic()
 
-        start_time = time.perf_counter()
+        # --------------------------------------------------------------
+        # Vérification de FFmpeg
+        # --------------------------------------------------------------
 
-        try:
+        self._check_executable(command[0])
+
+        # --------------------------------------------------------------
+        # Mode classique
+        # --------------------------------------------------------------
+
+        if progress_callback is None:
+
             process = subprocess.Popen(
                 command,
                 stdout=subprocess.PIPE,
@@ -58,52 +87,146 @@ class FFmpegRunner:
                 text=True,
                 encoding="utf-8",
                 errors="replace",
-                shell=False,
+                stdin=subprocess.DEVNULL,
             )
 
-        except FileNotFoundError as exc:
-            raise FFmpegNotFoundError(
-                f"Executable not found: {command[0]}"
-            ) from exc
+            stdout, stderr = process.communicate()
 
-        stdout, stderr = process.communicate()
+            duration = (
+                time.monotonic()
+                - start_time
+            )
 
-        elapsed = time.perf_counter() - start_time
+            return CommandResult(
+                command=command,
+                return_code=process.returncode,
+                stdout=stdout,
+                stderr=stderr,
+                duration=duration,
+            )
 
-        if progress_callback:
-            for line in stderr.splitlines():
-                progress_callback(line)
+        # --------------------------------------------------------------
+        # Mode avec progression
+        # --------------------------------------------------------------
+
+        command = list(command)
+
+        command.extend(
+            [
+                "-progress",
+                "pipe:1",
+                "-nostats",
+            ]
+        )
+
+        process = subprocess.Popen(
+            command,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            bufsize=1,
+            stdin=subprocess.DEVNULL,
+        )
+
+        parser = FFmpegProgressParser(
+            duration=progress_duration,
+            operation_name=operation_name,
+            operation_id=operation_id,
+        )
+
+        stderr_lines: list[str] = []
+
+        # --------------------------------------------------------------
+        # Lecture de stderr dans un thread séparé
+        #
+        # Cela évite un blocage si stderr se remplit.
+        # --------------------------------------------------------------
+
+        def read_stderr() -> None:
+
+            if process.stderr is None:
+                return
+
+            for line in process.stderr:
+                stderr_lines.append(line)
+
+        stderr_thread = threading.Thread(
+            target=read_stderr,
+            daemon=True,
+        )
+
+        stderr_thread.start()
+
+        # --------------------------------------------------------------
+        # Lecture de stdout = progression FFmpeg
+        # --------------------------------------------------------------
+
+        if process.stdout is not None:
+
+            for line in process.stdout:
+
+                event = parser.feed(line)
+
+                if event is not None:
+                    progress_callback(event)
+
+        # --------------------------------------------------------------
+        # Attendre FFmpeg
+        # --------------------------------------------------------------
+
+        process.wait()
+
+        stderr_thread.join()
+
+        duration = (
+            time.monotonic()
+            - start_time
+        )
+
+        stderr = "".join(stderr_lines)
 
         result = CommandResult(
             command=command,
             return_code=process.returncode,
-            stdout=stdout,
+            stdout="",
             stderr=stderr,
-            duration=elapsed,
+            duration=duration,
         )
 
-        if check and process.returncode != 0:
+        # --------------------------------------------------------------
+        # Erreur FFmpeg
+        # --------------------------------------------------------------
+
+        if result.return_code != 0:
+
             raise FFmpegExecutionError(
-                message=(
-                    f"FFmpeg command failed with return code "
-                    f"{process.returncode}."
-                ),
-                command=command,
-                return_code=process.returncode,
-                stderr=stderr,
+                stderr or
+                f"FFmpeg a retourné le code "
+                f"{result.return_code}."
             )
 
         return result
 
+    # ==================================================================
+    # FFmpeg
+    # ==================================================================
+
     def ffmpeg(
         self,
-        args: Sequence[str],
-        *,
-        progress_callback: ProgressCallback | None = None,
+        args: list[str],
+        progress_callback: Callable[
+            [ProgressEvent],
+            None
+        ] | None = None,
+        progress_duration: float | None = None,
+        operation_name: str | None = None,
+        operation_id: int | None = None,
     ) -> CommandResult:
 
         command = [
-            self.config.ffmpeg,
+            self.config.ffmpeg_path,
             "-hide_banner",
             "-loglevel",
             self.config.loglevel,
@@ -111,23 +234,36 @@ class FFmpegRunner:
 
         if self.config.overwrite:
             command.append("-y")
-        else:
-            command.append("-n")
+
+        if self.config.threads is not None:
+            command.extend(
+                [
+                    "-threads",
+                    str(self.config.threads),
+                ]
+            )
 
         command.extend(args)
 
         return self.run(
             command,
             progress_callback=progress_callback,
+            progress_duration=progress_duration,
+            operation_name=operation_name,
+            operation_id=operation_id,
         )
+
+    # ==================================================================
+    # FFprobe
+    # ==================================================================
 
     def ffprobe(
         self,
-        args: Sequence[str],
+        args: list[str],
     ) -> CommandResult:
 
         command = [
-            self.config.ffprobe,
+            self.config.ffprobe_path,
             "-hide_banner",
             "-loglevel",
             self.config.loglevel,
@@ -137,14 +273,54 @@ class FFmpegRunner:
 
         return self.run(command)
 
-    def ensure_output_directory(self, output: str | Path) -> None:
-        if not self.config.create_output_directories:
-            return
+    # ==================================================================
+    # Vérification de l'exécutable
+    # ==================================================================
 
-        output_path = Path(output)
+    @staticmethod
+    def _check_executable(
+        executable: str,
+    ) -> None:
 
-        if output_path.parent != Path("."):
-            output_path.parent.mkdir(
+        try:
+
+            subprocess.run(
+                [
+                    executable,
+                    "-version",
+                ],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                stdin=subprocess.DEVNULL,
+                check=True,
+            )
+
+        except FileNotFoundError as exc:
+
+            raise FFmpegNotFoundError(
+                f"Exécutable introuvable : {executable}"
+            ) from exc
+
+        except subprocess.CalledProcessError:
+            # L'exécutable existe mais la commande
+            # de vérification a échoué.
+            pass
+
+    # ==================================================================
+    # Création du dossier de sortie
+    # ==================================================================
+
+    @staticmethod
+    def ensure_output_directory(
+        output_path: str | Path,
+    ) -> None:
+
+        output_path = Path(output_path)
+
+        parent = output_path.parent
+
+        if parent != Path("."):
+            parent.mkdir(
                 parents=True,
                 exist_ok=True,
             )

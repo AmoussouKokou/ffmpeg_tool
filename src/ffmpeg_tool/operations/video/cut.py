@@ -1,77 +1,123 @@
-from dataclasses import dataclass
+from __future__ import annotations
 
-from ..base import Operation
-from ...utils.time import (
-    format_time,
-    validate_range,
-)
+from ffmpeg_tool.operations.base import Operation
+from ffmpeg_tool.utils.time import parse_time, validate_range
 
 
-@dataclass
 class CutVideo(Operation):
+    """
+    Coupe une vidéo entre deux positions temporelles.
 
-    input: str
-    output_path: str
+    Les temps peuvent être fournis sous forme :
 
-    start: int | float | str
-    end: int | float | str
+        30
+        30.5
+        "01:30"
+        "00:01:30"
+    """
 
-    copy: bool = False
+    def __init__(
+        self,
+        input: str,
+        output_path: str,
+        start: int | float | str,
+        end: int | float | str,
+        copy: bool = False,
+        video_codec: str | None = None,
+        audio_codec: str | None = None,
+    ) -> None:
 
-    video_codec: str | None = None
-    audio_codec: str | None = None
+        super().__init__(output_path)
 
-    @property
-    def output(self) -> str:
-        return self.output_path
+        self.input = input
 
-    def build_args(self) -> list[str]:
+        self.start = parse_time(start)
+        self.end = parse_time(end)
 
-        self.check_input(self.input)
-
-        start, end = validate_range(
+        validate_range(
             self.start,
             self.end,
         )
 
-        duration = end - start
+        self.copy = copy
+        self.video_codec = video_codec
+        self.audio_codec = audio_codec
+
+    # ==================================================================
+    # Durée de la portion à produire
+    # ==================================================================
+
+    def get_progress_duration(
+        self,
+        runner,
+    ) -> float:
+
+        return self.end - self.start
+
+    # ==================================================================
+    # Construction FFmpeg
+    # ==================================================================
+
+    def build_args(self) -> list[str]:
+
+        duration = self.end - self.start
+
+        args: list[str] = []
+
+        # --------------------------------------------------------------
+        # Copie directe
+        # --------------------------------------------------------------
 
         if self.copy:
 
-            args = [
-                "-ss",
-                format_time(start),
-                "-i",
-                self.input,
-                "-t",
-                format_time(duration),
-                "-c",
-                "copy",
-            ]
+            args.extend(
+                [
+                    "-ss",
+                    str(self.start),
+                    "-i",
+                    self.input,
+                    "-t",
+                    str(duration),
+                    "-c",
+                    "copy",
+                ]
+            )
+
+        # --------------------------------------------------------------
+        # Réencodage
+        # --------------------------------------------------------------
 
         else:
 
-            args = [
-                "-i",
-                self.input,
-                "-ss",
-                format_time(start),
-                "-t",
-                format_time(duration),
-            ]
+            args.extend(
+                [
+                    "-i",
+                    self.input,
+                    "-ss",
+                    str(self.start),
+                    "-t",
+                    str(duration),
+                ]
+            )
 
-            if self.video_codec:
-                args.extend([
-                    "-c:v",
-                    self.video_codec,
-                ])
+            if self.video_codec is not None:
 
-            if self.audio_codec:
-                args.extend([
-                    "-c:a",
-                    self.audio_codec,
-                ])
+                args.extend(
+                    [
+                        "-c:v",
+                        self.video_codec,
+                    ]
+                )
 
-        args.append(self.output_path)
+            if self.audio_codec is not None:
+
+                args.extend(
+                    [
+                        "-c:a",
+                        self.audio_codec,
+                    ]
+                )
+
+        args.append(self.output)
 
         return args
